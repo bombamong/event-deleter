@@ -10,16 +10,39 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"io/fs"
 	"log"
 	"os"
 	"strings"
 )
 
-func exitErrorf(msg string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, msg+"\n", args...)
-	os.Exit(1)
-}
+var masterLogFile *os.File
 
+func init() {
+	err := os.Mkdir("./download", fs.ModePerm)
+	if err != nil {
+		log.Printf("error creating directory %v", err)
+		if !strings.Contains(err.Error(), "exists") {
+			os.Exit(0)
+		}
+	}
+	err = os.Mkdir("./upload", fs.ModePerm)
+	if err != nil {
+		log.Printf("error creating directory %v", err)
+		if !strings.Contains(err.Error(), "exists") {
+			os.Exit(0)
+		}
+	}
+	err = os.Mkdir("./logs", fs.ModePerm)
+	if err != nil {
+		log.Printf("error creating directory %v", err)
+		if !strings.Contains(err.Error(), "exists") {
+			os.Exit(0)
+		}
+	}
+	file, _ := os.Create("./logs/master.log")
+	masterLogFile = file
+}
 
 
 func main() {
@@ -29,79 +52,70 @@ func main() {
 	if err != nil {
 		exitErrorf("error opening session")
 	}
-	var _ = sess
 
-	// test: received-events/2020/09/18/08/airbloc-events-6-2020-09-18-08-37-41-3fc9ff68-7249-490e-9fb6-762a75bde37d.gz
 	svc := s3.New(sess)
 	downloader := s3manager.NewDownloader(sess)
+	uploader := s3manager.NewUploader(sess)
+	var _ = uploader
 
-	buckets := map[string]*string{
-		"dev" : aws.String("airbloc-warehouse-dev"),
-		"prod" : aws.String("airbloc-warehouse-prod"),
+	buckets := map[string]string{
+		"dev" : "airbloc-warehouse-dev",
+		"prod" : "airbloc-warehouse-prod",
 	}
-
+	locs := []string{"received-events", "full-events"}
 	env := "dev"
-	resp, err := svc.ListObjectsV2(&s3.ListObjectsV2Input{
-		Bucket: buckets[env],
-		Prefix: aws.String("received-events"),
-	})
-	if err != nil {
-		exitErrorf("Unable to list items in bucket %q, %v", buckets[env], err)
+
+	var fileCount = 0
+	for _, loc := range locs {
+		masterLogWriter := bufio.NewWriter(masterLogFile)
+
+		resp, err := svc.ListObjectsV2(&s3.ListObjectsV2Input{
+			Bucket: aws.String(buckets[env]),
+			Prefix: aws.String(loc),
+		})
+		if err != nil {
+			errorMessage := fmt.Sprintf("Unable to list items in bucket %q, %v", buckets[env], err)
+			masterLogWriter.Write([]byte(errorMessage))
+			masterLogWriter.Flush()
+			exitErrorf(errorMessage)
+		}
+		for _, item := range resp.Contents {
+			key := *item.Key
+			arr := strings.Split(*item.Key, "/")
+			filename:= arr[len(arr) - 1]
+
+			if filename != "" {
+				fileCount++
+
+				str := fmt.Sprintf("\nThis is file #%d\n", fileCount)
+				masterLogWriter.Write([]byte(str))
+				masterLogWriter.Flush()
+				log.Print(str)
+
+				Download(downloader, buckets[env], key, filename)
+				RemoveJoongnaEvents(filename)
+				Upload(uploader, buckets[env], key, filename)
+				CleanUp(filename)
+
+				masterLogWriter.Write([]byte{'\n'})
+				masterLogWriter.Flush()
+				fmt.Print("\n\n")
+			}
+		}
 	}
-	for _, item := range resp.Contents {
-		v := ""
-		v += fmt.Sprintf("Name:         %v \n", *item.Key)
-		v += fmt.Sprintf("Last modified:%v \n", *item.LastModified)
-		v += fmt.Sprintf("Size:         %v \n", *item.Size)
-		v += fmt.Sprintf("Storage class:%v \n\n", *item.StorageClass)
-
-		arr := strings.Split(*item.Key, "/")
-		filename:= arr[len(arr) - 1]
-
-		Download(downloader, *buckets[env], *item.Key, filename)
-		RemoveJoongnaEvents(filename)
-
-		fmt.Println(v)
-		break
-	}
-
-	//for _, b := range result.Buckets {
-		//_, err := w.WriteString(fmt.Sprintf("* %s created on %s\n",
-		//	aws.StringValue(b.Name), aws.TimeValue(b.CreationDate)))
-		//if err != nil {
-		//	exitErrorf("error writing bucket info to file")
-		//}
-
-
-
-		//resp, err := svc.ListObjectsV2(&s3.ListObjectsV2Input{Bucket: aws.String(aws.StringValue(b.Name))})
-		//if err != nil {
-		//	exitErrorf("Unable to list items in bucket %q, %v", aws.StringValue(b.Name), err)
-		//}
-
-		//for _, item := range resp.Contents {
-		//	v := ""
-		//	v += fmt.Sprintf("Name:         %v \n", *item.Key)
-		//	v += fmt.Sprintf("Last modified:%v \n", *item.LastModified)
-		//	v += fmt.Sprintf("Size:         %v \n", *item.Size)
-		//	v += fmt.Sprintf("Storage class:%v \n\n", *item.StorageClass)
-		//	fmt.Println(v)
-		//	//_, err := w.WriteString(v)
-		//	//if err != nil {
-		//	//	exitErrorf("error writing item info to file")
-		//	//}
-		//}
-	//}
-	//err = w.Flush()
-	//if err != nil {
-	//	exitErrorf("error flushing writer")
-	//}
+	defer masterLogFile.Close()
 }
 
 func Download(downloader *s3manager.Downloader, bucket, key, filename string) {
+	masterLogWriter := bufio.NewWriter(masterLogFile)
+	defer masterLogWriter.Flush()
+
 	file, err := os.Create(fmt.Sprintf("./download/%s", filename))
 	if err != nil {
-		exitErrorf("error creating file for /download %v", err)
+		errorMessage := fmt.Sprintf("error creating file for /download %v", err)
+		masterLogWriter.Write([]byte(errorMessage))
+		exitErrorf(errorMessage)
+		return
 	}
 	defer file.Close()
 
@@ -111,33 +125,55 @@ func Download(downloader *s3manager.Downloader, bucket, key, filename string) {
 			Key:    aws.String(key),
 		})
 	if err != nil {
-		exitErrorf("Unable to download item %q, %v", key, err)
+		errorMessage := fmt.Sprintf("Unable to download item %q, %v", key, err)
+		masterLogWriter.Write([]byte(errorMessage))
+		exitErrorf(errorMessage)
+		return
 	}
-	fmt.Println("Downloaded", file.Name(), numBytes, "bytes")
+
+	summary := fmt.Sprintf("Downloaded %s: %d bytes\n", file.Name(), numBytes)
+	masterLogWriter.Write([]byte(summary))
+	log.Print(summary)
 }
 
 func RemoveJoongnaEvents(filename string) {
+	masterLogWriter := bufio.NewWriter(masterLogFile)
+	defer masterLogWriter.Flush()
+
 	data, err := os.ReadFile(fmt.Sprintf("./download/%s", filename))
 	if err != nil {
-		exitErrorf("error reading %s to fix", filename)
+		errorMessage := fmt.Sprintf("error reading %s to fix", filename)
+		masterLogWriter.Write([]byte(errorMessage))
+		exitErrorf(errorMessage)
+		return
 	}
 	buffer := bytes.NewBuffer(data)
 
-	logFile, err := os.Create(fmt.Sprintf("./output/%s.delete.log", filename))
+	deleteLogFileName := fmt.Sprintf("./logs/%s.delete.log", filename)
+	deleteLogFile, err := os.Create(deleteLogFileName)
 	if err != nil {
-		exitErrorf("error creating logfile for %s", filename)
+		errorMessage := fmt.Sprintf("error creating logfile for %s", filename)
+		masterLogWriter.Write([]byte(errorMessage))
+		exitErrorf(errorMessage)
+		return
 	}
-	defer logFile.Close()
-	logBuffer := bufio.NewWriter(logFile)
+
+	deleteLogBuffer := bufio.NewWriter(deleteLogFile)
 
 	gReader, err := gzip.NewReader(buffer)
 	if err != nil {
-		exitErrorf("error calling new gzip reader for %s\n", filename)
+		errorMessage := fmt.Sprintf("error calling new gzip reader for %s\n", filename)
+		masterLogWriter.Write([]byte(errorMessage))
+		exitErrorf(errorMessage)
+		return
 	}
 
-	newFile, err := os.Create(fmt.Sprintf("./filtered/%s", filename))
+	newFile, err := os.Create(fmt.Sprintf("./upload/%s", filename))
 	if err != nil {
-		exitErrorf("error creating filtered file for %s", filename)
+		errorMessage := fmt.Sprintf("error creating filtered file for %s", filename)
+		masterLogWriter.Write([]byte(errorMessage))
+		exitErrorf(errorMessage)
+		return
 	}
 	defer newFile.Close()
 	gw := gzip.NewWriter(newFile)
@@ -151,37 +187,63 @@ func RemoveJoongnaEvents(filename string) {
 		byteData := scanner.Bytes()
 		err = json.Unmarshal(byteData, &lineData)
 		if err != nil {
-			exitErrorf("error unmarshalling lineData")
+			errorMessage := fmt.Sprintf("error unmarshalling lineData")
+			masterLogWriter.Write([]byte(errorMessage))
+			exitErrorf(errorMessage)
+			return
 		}
 		if lineData["dataSource"].(string) == "joongna" {
 			deletedLines += 1
-			_, err = logBuffer.Write(append(byteData, '\n'))
+			_, err = deleteLogBuffer.Write(append(byteData, '\n'))
 			if err != nil {
-				log.Fatalf("error writing\n %s\n", string(byteData))
+				errorMessage := fmt.Sprintf("error writing\n %s\n", string(byteData))
+				masterLogWriter.Write([]byte(errorMessage))
+				log.Fatalln(errorMessage)
+				return
 			}
 		} else {
 			_, err := gw.Write(append(byteData, '\n'))
 			if err != nil {
-				log.Fatalf("error writing\n %s to %s\n", string(byteData), newFile.Name())
+				errorMessage := fmt.Sprintf("error writing\n %s to %s\n", string(byteData), newFile.Name())
+				masterLogWriter.Write([]byte(errorMessage))
+				log.Fatalln(errorMessage)
+				return
 			}
 		}
 	}
 	err = gw.Close()
 	if err != nil {
 		exitErrorf("error closing to %s", newFile.Name())
+		return
 	}
-	fmt.Printf("\nDeleted %d events from %s\n", deletedLines, filename)
-	err = logBuffer.Flush()
+	err = deleteLogBuffer.Flush()
 	if err != nil {
 		log.Fatalf("error flushing %s\n logfile", filename)
+		return
 	}
+	defer func(deletedLines int) {
+		deleteLogFile.Close()
+		if deletedLines == 0 {
+			os.Remove(deleteLogFileName)
+		}
+	}(deletedLines)
+
+	summary := fmt.Sprintf("Deleted %d events from %s\n", deletedLines, filename)
+	masterLogWriter.Write([]byte(summary))
+	log.Print(summary)
 }
 
 
-func Upload(bucket, key, filepath string, uploader *s3manager.Uploader) {
-	file, err := os.Open(filepath)
+func Upload(uploader *s3manager.Uploader, bucket, key, filename string, ) {
+	masterLogWriter := bufio.NewWriter(masterLogFile)
+	defer masterLogWriter.Flush()
+
+	file, err := os.Open(fmt.Sprintf("./upload/%s", filename))
+	defer file.Close()
 	if err != nil {
-		exitErrorf("Unable to open file %q, %v", err)
+		errorMessage := fmt.Sprintf("Unable to open file %q, %v", err)
+		masterLogWriter.Write([]byte(errorMessage))
+		exitErrorf(errorMessage)
 	}
 	defer file.Close()
 	_, err = uploader.Upload(&s3manager.UploadInput{
@@ -190,22 +252,28 @@ func Upload(bucket, key, filepath string, uploader *s3manager.Uploader) {
 		Body: file,
 	})
 	if err != nil {
-		// Print the error and exit.
-		exitErrorf("Unable to upload %q to %q, %v", key, bucket, err)
+		errorMessage := fmt.Sprintf("Unable to upload %q to %q, %v", key, bucket, err)
+		masterLogWriter.Write([]byte(errorMessage))
+		exitErrorf(errorMessage)
 	}
-	fmt.Printf("Successfully uploaded %q to %q\n", key, bucket)
+	summary := fmt.Sprintf("Successfully uploaded %q to %q\n", key, bucket)
+	masterLogWriter.Write([]byte(summary))
+	log.Print(summary)
 }
 
 
-func CleanUp() {
-
+func CleanUp(filename string) {
+	paths := []string{"./download", "./upload"}
+	for _, path := range paths {
+		err := os.Remove(fmt.Sprintf("%s/%s", path, filename))
+		if err != nil {
+			log.Fatalf("error removing %s\n", filename)
+		}
+		fmt.Printf("removed %s\n", fmt.Sprintf("%s/%s", path, filename))
+	}
 }
 
-// 파일 다운 -> save to zipped/
-// unzip -> save to unzipped/
-// open unzipped/*.json 파일 파싱 및 joongna 삭제 -> 지운 이벤트 filename.log 저장
-// zip(GZIP) ->  upload/ 에 파일 저장
-// original S3 파일 .erase 로 rename
-// upload/*.gz 업로드
-// rm donwload/* download/*
-// repeat
+func exitErrorf(msg string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, msg+"\n", args...)
+	os.Exit(1)
+}

@@ -1,0 +1,9 @@
+.env
+logs/
+download/
+upload/
+sample/*
+output/*
+filtered/*
+.DS_Store
+.idea/vcs.xml

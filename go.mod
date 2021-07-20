@@ -1,5 +1,5 @@
-module event-deleter
+module github.com/event-deleter
 
 go 1.16
 
-require github.com/aws/aws-sdk-go v1.40.2 // indirect
+require github.com/aws/aws-sdk-go v1.40.3
